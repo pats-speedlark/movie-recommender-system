@@ -1,0 +1,17 @@
+[server]
+headless = true
+enableCORS = false
+maxUploadSize = 5
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "dark"
+primaryColor = "#ff4b6e"
+backgroundColor = "#0f1117"
+secondaryBackgroundColor = "#1a1d26"
+textColor = "#f1f3f8"
+
+[client]
+toolbarMode = "viewer"
