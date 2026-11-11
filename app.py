@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import html
 import os
 import random
@@ -41,16 +42,24 @@ st.set_page_config(page_title="CineMatch · Movie Recommender", page_icon="🎬"
 # Config
 # --------------------------------------------------------------------------- #
 def get_api_key() -> str | None:
-    key = os.getenv("TMDB_API_KEY") or os.getenv("API_KEY")
-    if key:
-        return key.strip()
-    try:
-        return st.secrets.get("TMDB_API_KEY") or st.secrets.get("API_KEY")
-    except Exception:  # no secrets.toml present
+    key = os.getenv("TMDB_API_KEY") or os.getenv("API_KEY") or os.getenv("TMDB_TOKEN")
+    if not key:
+        try:
+            key = st.secrets.get("TMDB_API_KEY") or st.secrets.get("API_KEY")
+        except Exception:  # no secrets.toml present
+            key = None
+    if not key:
         return None
+    # Tolerate values pasted with quotes or a "Bearer " prefix.
+    key = key.strip().strip("'\"").strip()
+    if key.lower().startswith("bearer "):
+        key = key[7:].strip()
+    return key or None
 
 
 API_KEY = get_api_key()
+# Serve posters through this server (default) so ISP blocks on image.tmdb.org don't matter.
+PROXY_IMAGES = os.getenv("PROXY_POSTERS", "1").lower() not in ("0", "false", "no")
 
 
 # --------------------------------------------------------------------------- #
@@ -78,24 +87,64 @@ def http_session() -> requests.Session:
     return session
 
 
+def tmdb_auth() -> tuple[dict, dict]:
+    """Return (params, headers). Supports both TMDB credential types:
+    the short v3 "API Key" and the long v4 "API Read Access Token" (a JWT)."""
+    if API_KEY and (API_KEY.startswith("eyJ") or len(API_KEY) > 60):
+        return {}, {"Authorization": f"Bearer {API_KEY}", "accept": "application/json"}
+    return {"api_key": API_KEY}, {"accept": "application/json"}
+
+
+class TMDBError(Exception):
+    pass
+
+
 @st.cache_data(ttl=60 * 60 * 24, max_entries=5000, show_spinner=False)
+def _fetch_details(movie_id: int) -> dict:
+    """Cached TMDB lookup. Raises on failure so errors are *not* cached."""
+    params, headers = tmdb_auth()
+    resp = http_session().get(
+        TMDB_API.format(movie_id=movie_id), params=params, headers=headers, timeout=6
+    )
+    if resp.status_code == 404:  # movie removed from TMDB - cache the miss
+        return {}
+    if resp.status_code != 200:
+        raise TMDBError(f"HTTP {resp.status_code}")
+    return resp.json()
+
+
+@st.cache_data(ttl=60 * 60 * 24 * 7, max_entries=3000, show_spinner=False)
+def _fetch_image(poster_path: str) -> str:
+    """Download a poster on the server and return it as a data URI.
+
+    Images are served from our own server instead of image.tmdb.org, because
+    that domain is blocked by several ISPs (e.g. in India), which leaves the
+    browser with broken posters even though the API call worked.
+    """
+    resp = http_session().get(TMDB_IMG + poster_path, timeout=8)
+    resp.raise_for_status()
+    mime = resp.headers.get("content-type", "image/jpeg").split(";")[0]
+    return f"data:{mime};base64," + base64.b64encode(resp.content).decode()
+
+
 def fetch_details(movie_id: int) -> dict:
-    """Fetch poster/rating/year/overview from TMDB. Never raises."""
+    """Poster/rating/year/overview for a movie. Never raises."""
     details = {"poster": PLACEHOLDER, "rating": None, "year": None, "overview": "", "genres": []}
     if not API_KEY:
         return details
     try:
-        resp = http_session().get(
-            TMDB_API.format(movie_id=movie_id), params={"api_key": API_KEY}, timeout=5
-        )
-        if resp.status_code != 200:
-            return details
-        data = resp.json()
-    except (requests.RequestException, ValueError):
+        data = _fetch_details(movie_id)
+    except (requests.RequestException, ValueError, TMDBError):
         return details
 
     if data.get("poster_path"):
-        details["poster"] = TMDB_IMG + data["poster_path"]
+        if PROXY_IMAGES:
+            try:
+                details["poster"] = _fetch_image(data["poster_path"])
+            except requests.RequestException:
+                details["poster"] = TMDB_IMG + data["poster_path"]
+        else:
+            details["poster"] = TMDB_IMG + data["poster_path"]
     if data.get("vote_average"):
         details["rating"] = round(float(data["vote_average"]), 1)
     if data.get("release_date"):
@@ -108,6 +157,26 @@ def fetch_details(movie_id: int) -> dict:
 def fetch_many(movie_ids: list[int]) -> list[dict]:
     with ThreadPoolExecutor(max_workers=10) as pool:
         return list(pool.map(fetch_details, movie_ids))
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def tmdb_status() -> tuple[bool, str]:
+    """Quick connectivity/auth check shown in the sidebar."""
+    if not API_KEY:
+        return False, "No TMDB key set. Add `TMDB_API_KEY` in your Railway service Variables."
+    params, headers = tmdb_auth()
+    try:
+        resp = http_session().get(
+            TMDB_API.format(movie_id=550), params=params, headers=headers, timeout=6
+        )
+    except requests.RequestException as exc:
+        return False, f"Can't reach api.themoviedb.org from the server ({type(exc).__name__})."
+    if resp.status_code == 200:
+        kind = "read access token" if "Authorization" in headers else "API key"
+        return True, f"TMDB connected (using {kind})."
+    if resp.status_code == 401:
+        return False, "TMDB rejected the key (401). Check `TMDB_API_KEY` is your TMDB API key or read access token, without extra characters."
+    return False, f"TMDB returned HTTP {resp.status_code}."
 
 
 # --------------------------------------------------------------------------- #
@@ -244,11 +313,11 @@ def main() -> None:
             "Recommendations use TF-IDF similarity over each film's plot, genres, "
             "keywords, top cast and director."
         )
-        if not API_KEY:
-            st.warning(
-                "No TMDB API key found — posters and ratings are disabled. "
-                "Set the `TMDB_API_KEY` (or `API_KEY`) environment variable."
-            )
+        ok, msg = tmdb_status()
+        if ok:
+            st.success(msg, icon="✅")
+        else:
+            st.warning(msg + " Posters and ratings are disabled until this is fixed.", icon="⚠️")
 
     if "picks" not in st.session_state:
         st.session_state.picks = [labels[0]]
